@@ -377,27 +377,38 @@ def serve_fasthtml():
             Div(id="top-sources"),
             cls="flex flex-col items-center min-h-screen bg-black",
         )
-
+    #
     def chat_top_sources(top_sources):
         """Display the filenames of the top sources without URLs."""
+        #
         return Div(
+        Div(
+            Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
             Div(
-                Div("Top Sources", cls="text-zinc-400 text-sm"),
-                Div(
-                    *[
-                        # Just show the PDF filename as a Span
-                        Span(
-                            source['filename'],
-                            cls="font-mono text-green-500 text-sm"
-                        )
-                        for source in top_sources
-                    ],
-                    cls="flex items-center justify-start gap-2",
-                ),
-                cls="flex flex-col items-center gap-1",
+                *[
+                    Div(
+                        [
+                            Span(
+                                os.path.basename(source['filename']),
+                                cls="text-green-500"
+                            ),
+                            Span(
+                                f" (Page {source['page']})",
+                                cls="text-zinc-400"
+                            )
+                        ],
+                        cls="font-mono text-sm"
+                    )
+                    for source in top_sources
+                ],
+                cls="flex flex-col items-start gap-2",
             ),
-            cls="flex flex-col items-center gap-1",
-        )
+            cls="flex flex-col items-start gap-2",
+        ),
+        cls="flex flex-col items-start gap-2 p-2 bg-zinc-800 rounded-md",
+    )
+
+        
 
     @fasthtml_app.ws("/ws")
     async def ws(msg: str, session_id: str, send):
@@ -488,25 +499,33 @@ def serve_fasthtml():
         )
 
         # Retrieve top docs from FAISS
-        question_embedding = emb_model.encode([msg], normalize_embeddings=True)
-        question_embedding = question_embedding.astype('float32')
-        K = 1
-        distances, indices = index.search(question_embedding, K)
-        retrieved_docs = [docs[idx] for idx in indices[0]]
-
-        # Build top_sources with filenames
+        query_embedding = emb_model.encode([msg], normalize_embeddings=True)
+        query_embedding = query_embedding.astype('float32')
+        
+        K = 2  # Define K 
+        distances, indices = index.search(query_embedding, K)
+        
+        retrieved_paragraphs = []
         top_sources = []
+
         for i, idx in enumerate(indices[0][:K]):
-            similarity_score = float(1 - distances[0][i])  # turn distance into similarity
+            similarity_score = float(1 - distances[0][i])  # Convert distance to similarity
+            paragraph_text = df.iloc[idx]['text']
             pdf_filename = df.iloc[idx]['filename']
+            page_num = df.iloc[idx]['page']
+            paragraph_size = df.iloc[idx]['paragraph_size']  # New metadata we're tracking
+            
+            retrieved_paragraphs.append(paragraph_text)
             top_sources.append({
                 'filename': pdf_filename,
+                'page': page_num,
+                'paragraph_size': paragraph_size,  # Include size in metadata
                 'similarity_score': similarity_score
             })
-
+        
         # Construct context
-        context = "\n\n".join(retrieved_docs)
-
+        context = "\n\n".join(retrieved_paragraphs)
+    
         def build_conversation(messages, max_length=2000):
             conversation = ''
             total_length = 0
@@ -539,7 +558,7 @@ Assistant:"""
             "Do not mention conversation history directly."
         )
 
-        context = "\n\n".join(retrieved_docs[:2])
+        context = "\n\n".join(retrieved_paragraphs[:2])
         prompt = build_prompt(system_prompt, context, conversation_history)
 
         print(f"Final Prompt being passed to the LLM:\n{prompt}\n")
