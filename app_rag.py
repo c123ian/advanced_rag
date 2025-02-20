@@ -276,6 +276,7 @@ def serve_fasthtml():
     from sqlalchemy.ext.declarative import declarative_base
     from sqlalchemy.orm import sessionmaker
     import datetime
+    from rerankers import Reranker
 
     SECRET_KEY = os.environ.get('YOUR_KEY')
     if not SECRET_KEY:
@@ -498,7 +499,7 @@ def serve_fasthtml():
         sqlalchemy_session.add(new_message)
         sqlalchemy_session.commit()
 
-        await send(chat_form(disabled=True))
+        await send(chat_form(disabled=False))
         await send(
             Div(
                 chat_message(message_index, messages=messages),
@@ -507,33 +508,46 @@ def serve_fasthtml():
             )
         )
 
+        # init reranker
+        ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
+
         # Retrieve top docs from FAISS
-        query_embedding = emb_model.encode([msg], normalize_embeddings=True)
-        query_embedding = query_embedding.astype('float32')
-        
-        K = 2  # Define K 
+        query_embedding = emb_model.encode([msg], normalize_embeddings=True).astype('float32')
+        K = 10  # Retrieve more candidates for reranking
         distances, indices = index.search(query_embedding, K)
-        
+
         retrieved_paragraphs = []
         top_sources = []
+        docs_for_reranking = []
 
         for i, idx in enumerate(indices[0][:K]):
-            similarity_score = float(1 - distances[0][i])  # Convert distance to similarity
             paragraph_text = df.iloc[idx]['text']
             pdf_filename = df.iloc[idx]['filename']
             page_num = df.iloc[idx]['page']
-            paragraph_size = df.iloc[idx]['paragraph_size']  # New metadata we're tracking
+            similarity_score = float(1 - distances[0][i])  # Convert FAISS distance to similarity
             
             retrieved_paragraphs.append(paragraph_text)
-            top_sources.append({
-                'filename': pdf_filename,
-                'page': page_num,
-                'paragraph_size': paragraph_size,  # Include size in metadata
-                'similarity_score': similarity_score
-            })
-        
-        # Construct context
-        context = "\n\n".join(retrieved_paragraphs)
+            top_sources.append({'filename': pdf_filename, 'page': page_num, 'similarity_score': similarity_score})
+            
+            # Store document for reranking
+            docs_for_reranking.append(paragraph_text)
+
+        # **RERANKING PHASE**
+        ranked_results = ranker.rank(query=msg, docs=docs_for_reranking)
+        top_ranked_docs = ranked_results.top_k(3)  # Take the top 3 reranked
+
+        # Extract final top paragraphs and sources after reranking
+        final_retrieved_paragraphs = []
+        final_top_sources = []
+
+        for ranked_doc in top_ranked_docs:
+            ranked_idx = docs_for_reranking.index(ranked_doc.text)
+            final_retrieved_paragraphs.append(ranked_doc.text)
+            final_top_sources.append(top_sources[ranked_idx])  # Preserve metadata
+
+        # Construct context for LLM
+        context = "\n\n".join(final_retrieved_paragraphs)
+
     
         def build_conversation(messages, max_length=2000):
             conversation = ''
@@ -559,12 +573,11 @@ Context Information:
 Conversation History:
 {conversation_history}
 Assistant:"""
-
+        # https://smith.lang.chat/hub
         system_prompt = (
-            "You are an 'Agony Aunt' who helps individuals clarify their options. "
-            "Provide thoughtful, empathetic, and helpful responses. "
-            "Refer to the provided context for guidance. "
-            "Do not mention conversation history directly."
+            "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
+            "If you don't know the answer, just say that you don't know."
+            "Use three sentences maximum and keep the answer concise."
         )
 
         context = "\n\n".join(retrieved_paragraphs[:2])
@@ -616,9 +629,9 @@ Assistant:"""
                         session_id=session_id,
                         role='assistant',
                         content=messages[message_index]["content"],
-                        top_source_headline=top_sources[0]['filename'],  # show the PDF filename
+                        top_source_headline=final_top_sources[0]['filename'],  # show the PDF filename
                         top_source_url=None,  # no URL
-                        cosine_sim_score=top_sources[0]['similarity_score']
+                        cosine_sim_score=final_top_sources[0]['similarity_score']
                     )
                     sqlalchemy_session.add(new_assistant_message)
                     sqlalchemy_session.commit()
@@ -636,7 +649,7 @@ Assistant:"""
 
         await send(
             Div(
-                chat_top_sources(top_sources),
+                chat_top_sources(final_top_sources),
                 id="top-sources",
                 hx_swap_oob="innerHTML"
             )
