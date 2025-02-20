@@ -65,7 +65,7 @@ except modal.exception.NotFoundError:
 # Define the Modal image with required dependencies
 image = modal.Image.debian_slim(python_version="3.10") \
     .pip_install(
-        "vllm==0.5.3post1",
+        "vllm==0.7.2",
         "python-fasthtml==0.4.3",
         "aiohttp",          
         "faiss-cpu",        
@@ -73,7 +73,9 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "pandas",
         "numpy",
         "huggingface_hub",
-        "transformers",
+        "transformers==4.48.3", # Pinned to avoid LogitsWarper import error
+        "rerankers",
+        "sqlite-minutils",
         "sqlalchemy"
     )
 
@@ -104,95 +106,102 @@ app = modal.App(APP_NAME)
 @modal.asgi_app()
 def serve_vllm():
     import os
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.engine.async_llm_engine import AsyncLLMEngine
-    from vllm.sampling_params import SamplingParams
-    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-    from vllm.entrypoints.logger import RequestLogger
-    import fastapi
-    from fastapi.responses import StreamingResponse, JSONResponse
-    import uuid
     import asyncio
+    import fastapi
+    import uuid
+    from fastapi.responses import StreamingResponse, JSONResponse
     from typing import Optional
 
-    # Function to find the model path by searching for 'config.json'
+    from vllm.config import ModelConfig
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import AsyncLLMEngine
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    from vllm.entrypoints.openai.serving_models import OpenAIServingModels
+    from vllm.entrypoints.logger import RequestLogger
+    from vllm.sampling_params import SamplingParams
+
+    # Constants
+    MODEL_NAME = "Llama-3.1-8B-Instruct"
+    MODELS_DIR = "/llamas_8b"
+
+    # FastAPI Web Server
+    web_app = fastapi.FastAPI(
+        title=f"OpenAI-compatible {MODEL_NAME} server",
+        description="Run an OpenAI-compatible LLM server with vLLM",
+        version="0.0.1",
+        docs_url="/docs",
+    )
+
+    # --- Model Path Detection ---
     def find_model_path(base_dir):
-        for root, dirs, files in os.walk(base_dir):
+        for root, _, files in os.walk(base_dir):
             if "config.json" in files:
                 return root
         return None
 
-    # Function to find the tokenizer path by searching for 'tokenizer_config.json'
     def find_tokenizer_path(base_dir):
-        for root, dirs, files in os.walk(base_dir):
+        for root, _, files in os.walk(base_dir):
             if "tokenizer_config.json" in files:
                 return root
         return None
 
-    # Check if model files exist
     model_path = find_model_path(MODELS_DIR)
     if not model_path:
         raise Exception(f"Could not find model files in {MODELS_DIR}")
 
-    # Check if tokenizer files exist
     tokenizer_path = find_tokenizer_path(MODELS_DIR)
     if not tokenizer_path:
         raise Exception(f"Could not find tokenizer files in {MODELS_DIR}")
 
     print(f"Initializing AsyncLLMEngine with model path: {model_path} and tokenizer path: {tokenizer_path}")
 
-    # Create a FastAPI app
-    web_app = fastapi.FastAPI(
-        title=f"OpenAI-compatible {MODEL_NAME} server",
-        description="Run an OpenAI-compatible LLM server with vLLM on modal.com",
-        version="0.0.1",
-        docs_url="/docs",
-    )
-
-    # Create an `AsyncLLMEngine`, the core of the vLLM server.
+    # --- Initialize Engine ---
     engine_args = AsyncEngineArgs(
-        model=model_path,     
+        model=model_path,
         tokenizer=tokenizer_path,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.90,
     )
+
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-    # Get model config using the robust event loop handling
-    event_loop: Optional[asyncio.AbstractEventLoop]
+    # --- Get Model Config ---
+    event_loop: Optional[asyncio.AbstractEventLoop] = None
     try:
         event_loop = asyncio.get_running_loop()
     except RuntimeError:
-        event_loop = None
+        pass
 
-    if event_loop is not None and event_loop.is_running():
+    if event_loop and event_loop.is_running():
         model_config = event_loop.run_until_complete(engine.get_model_config())
     else:
         model_config = asyncio.run(engine.get_model_config())
 
-    # Initialize OpenAIServingChat
+    # --- Wrap ModelConfig in OpenAIServingModels ---
+    models = OpenAIServingModels(engine_client=engine, model_config=model_config, base_model_paths={MODEL_NAME: model_path})
+
+    # --- Initialize OpenAIServingChat ---
     request_logger = RequestLogger(max_log_len=256)
+
     openai_serving_chat = OpenAIServingChat(
-        engine,
-        model_config,
-        [MODEL_NAME],  
-        "assistant",
-        lora_modules=None,
-        prompt_adapters=None,
+        engine_client=engine,  # ✅ First positional argument
+        model_config=model_config,  # ✅ Second positional argument
+        models=models,  # ✅ Added models argument
+        response_role="assistant",  # ✅ Third positional argument
         request_logger=request_logger,
         chat_template=None,
+        chat_template_content_format="string",  # Set to render content as a string
     )
 
+    # --- Completion Endpoint ---
     @web_app.post("/v1/completions")
     async def completion_generator(request: fastapi.Request) -> StreamingResponse:
         try:
-            # Parse request body
             body = await request.json()
             prompt = body.get("prompt", "")
             max_tokens = body.get("max_tokens", 100)
             request_id = str(uuid.uuid4())
-            
-            # Set up sampling parameters
+
             sampling_params = SamplingParams(
                 temperature=0.7,
                 max_tokens=max_tokens,
@@ -204,19 +213,19 @@ def serve_vllm():
                 last_yielded_position = 0
                 assistant_prefix_removed = False
                 buffer = ""
-                
+
                 async for result in engine.generate(prompt, sampling_params, request_id):
                     if len(result.outputs) > 0:
                         new_text = result.outputs[0].text
-                        
+
                         if not assistant_prefix_removed:
                             new_text = new_text.split("Assistant:")[-1].lstrip()
                             assistant_prefix_removed = True
-                        
+
                         if len(new_text) > last_yielded_position:
                             new_part = new_text[last_yielded_position:]
                             buffer += new_part
-                            
+
                             words = buffer.split()
                             if len(words) > 1:
                                 to_yield = ' '.join(words[:-1]) + ' '
@@ -225,11 +234,11 @@ def serve_vllm():
                                 to_yield = ' '.join(to_yield.split())
                                 buffer = words[-1]
                                 yield to_yield + ' '
-                            
+
                             last_yielded_position = len(new_text)
-                        
+
                         full_response = new_text
-                
+
                 if buffer:
                     for punct in ['.', '!', '?']:
                         buffer = buffer.replace(f"{punct}", f"{punct} ")
@@ -237,7 +246,7 @@ def serve_vllm():
                     yield buffer
 
             return StreamingResponse(generate_text(), media_type="text/plain")
-            
+
         except Exception as e:
             return JSONResponse(
                 status_code=500,
