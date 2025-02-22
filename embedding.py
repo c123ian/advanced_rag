@@ -2,6 +2,7 @@ import modal
 import os
 import io
 import re
+import pickle
 from typing import List
 
 # Create a Modal image that includes required system libraries
@@ -19,7 +20,9 @@ pandas_faiss_image = (
         "pypdf",
         "Pillow",
         "rapidocr-onnxruntime",
-        "opencv-python-headless"
+        "opencv-python-headless",
+        "rank-bm25",  # Added BM25 library
+        "nltk"        # Added for tokenization
     )
 )
 
@@ -90,6 +93,16 @@ def process_pdfs_and_store_embeddings():
     import numpy as np
     import pandas as pd
     from sentence_transformers import SentenceTransformer
+    from rank_bm25 import BM25Okapi
+    import nltk
+    from nltk.tokenize import word_tokenize
+
+    # Download NLTK resources
+    NLTK_DATA_DIR = "/tmp/nltk_data"
+    os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+    nltk.data.path.append(NLTK_DATA_DIR)
+    nltk.download("punkt", download_dir=NLTK_DATA_DIR)
+    nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
 
     # Initialize embedding model once outside the loop
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -151,6 +164,21 @@ def process_pdfs_and_store_embeddings():
     index.add(embeddings)
     faiss.write_index(index, f"{FAISS_DATA_DIR}/faiss_index.bin")
 
+    # Create BM25 index
+    print("Creating BM25 index...")
+    # Tokenize paragraphs for BM25
+    tokenized_paragraphs = [word_tokenize(paragraph.lower()) for paragraph in all_paragraphs]
+    bm25_index = BM25Okapi(tokenized_paragraphs)
+    
+    # Save BM25 index
+    print("Saving BM25 index...")
+    with open(f"{FAISS_DATA_DIR}/bm25_index.pkl", "wb") as f:
+        pickle.dump(bm25_index, f)
+    
+    # Save tokenized paragraphs (needed for BM25 lookups)
+    with open(f"{FAISS_DATA_DIR}/tokenized_paragraphs.pkl", "wb") as f:
+        pickle.dump(tokenized_paragraphs, f)
+
     # Save associated DataFrame with paragraph-level metadata
     print("Saving metadata...")
     df = pd.DataFrame({
@@ -161,7 +189,7 @@ def process_pdfs_and_store_embeddings():
     })
     df.to_pickle(f"{FAISS_DATA_DIR}/data.pkl")
 
-    print("✅ Processing complete! FAISS index and text saved.")
+    print("✅ Processing complete! FAISS index, BM25 index, and text saved.")
     print(f"Total paragraphs processed: {len(all_paragraphs)}")
     print(f"Average paragraph size: {sum(meta['paragraph_size'] for meta in all_metadata) / len(all_metadata):.2f} characters")
 
