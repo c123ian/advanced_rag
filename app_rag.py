@@ -62,6 +62,7 @@ try:
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
+
 # Define the Modal image with required dependencies
 image = modal.Image.debian_slim(python_version="3.10") \
     .pip_install(
@@ -76,8 +77,11 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "transformers==4.48.3", # Pinned to avoid LogitsWarper import error
         "rerankers",
         "sqlite-minutils",
+        "rank-bm25", 
+        "nltk" ,        
         "sqlalchemy"
     )
+
 
 # Define the FAISS volume (using the new name "faiss_data_pdfs")
 try:
@@ -97,7 +101,8 @@ app = modal.App(APP_NAME)
 # vLLM server implementation with model path handling
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="40GB"),
+    gpu=modal.gpu.A100(count=1, size="40GB"), 
+    # gpu=modal.gpu.T4(count=1), # smaller gpu for GUI testing
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
@@ -261,6 +266,7 @@ def serve_vllm():
     volumes={FAISS_DATA_DIR: faiss_volume, DATABASE_DIR: db_volume},
     secrets=[modal.Secret.from_name("my-custom-secret-3")]
 )
+
 @modal.asgi_app()
 def serve_fasthtml():
     import faiss
@@ -277,40 +283,50 @@ def serve_fasthtml():
     from sqlalchemy.orm import sessionmaker
     import datetime
     from rerankers import Reranker
+    from nltk.tokenize import word_tokenize
+    import nltk
+    import numpy as np
+    from rank_bm25 import BM25Okapi
 
-    SECRET_KEY = os.environ.get('YOUR_KEY')
-    if not SECRET_KEY:
-        raise Exception("YOUR_KEY environment variable not set.")
-
-    # Updated file paths:
+    NLTK_DATA_DIR = "/tmp/nltk_data"
+    os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+    nltk.data.path.append(NLTK_DATA_DIR)
+    nltk.download("punkt", download_dir=NLTK_DATA_DIR)
+    nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
+    
+    
+    # Updated file paths
     FAISS_INDEX_PATH = os.path.join(FAISS_DATA_DIR, "faiss_index.bin")
     DATA_PICKLE_PATH = os.path.join(FAISS_DATA_DIR, "data.pkl")
-
+    
     # Load FAISS index
     index = faiss.read_index(FAISS_INDEX_PATH)
-
-    # Load new PDF-based DataFrame
+    
+    # Load PDF-based DataFrame (assumes columns "filename", "text", "page")
     df = pd.read_pickle(DATA_PICKLE_PATH)
-    # We assume columns "filename" and "text" exist, as per your PDF script
     docs = df['text'].tolist()
-
+    
     # Load embedding model
     emb_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
+    
+    # Prepare BM25 index
+    def create_bm25_index(documents):
+        tokenized_docs = [word_tokenize(doc.lower()) for doc in documents]
+        bm25_index = BM25Okapi(tokenized_docs)
+        return bm25_index, tokenized_docs
+    bm25_index, tokenized_docs = create_bm25_index(docs)
+    
     # Initialize FastHTML app
     fasthtml_app, rt = fast_app(
         hdrs=(
             Script(src="https://cdn.tailwindcss.com"),
-            Link(
-                rel="stylesheet",
-                href="https://cdn.jsdelivr.net/npm/daisyui@4.11.1/dist/full.min.css",
-            ),
+            Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@4.11.1/dist/full.min.css"),
         ),
         ws_hdr=True,
         middleware=[
             Middleware(
                 SessionMiddleware,
-                secret_key=SECRET_KEY,
+                secret_key=os.environ.get('YOUR_KEY'),
                 session_cookie="secure_session",
                 max_age=86400,
                 same_site="strict",
@@ -318,13 +334,12 @@ def serve_fasthtml():
             )
         ]
     )
-
+    
     # Session-specific messages
     session_messages = {}
-
+    
     # SQLAlchemy base + model
     Base = declarative_base()
-
     class Conversation(Base):
         __tablename__ = 'conversations_history_table_sqlalchemy_v2'
         message_id = Column(String, primary_key=True)
@@ -333,163 +348,99 @@ def serve_fasthtml():
         content = Column(String, nullable=False)
         top_source_headline = Column(String)
         top_source_url = Column(String)
-        cosine_sim_score = Column(Float)  # using Float
+        cosine_sim_score = Column(Float)
         created_at = Column(DateTime, default=datetime.datetime.utcnow)
-
+    
     # Create a SQLAlchemy engine + session
     db_engine = create_engine(f'sqlite:///{os.path.join(DATABASE_DIR, "chat_history.db")}')
     Session = sessionmaker(bind=db_engine)
     sqlalchemy_session = Session()
-
+    
     async def load_chat_history(session_id):
-        """Load chat history for a session from the database."""
         if not isinstance(session_id, str):
             logging.warning(f"Invalid session_id type: {type(session_id)}. Converting to string.")
             session_id = str(session_id)
-        
         if session_id not in session_messages:
             try:
                 session_history = sqlalchemy_session.query(Conversation)\
                     .filter(Conversation.session_id == session_id)\
                     .order_by(Conversation.created_at)\
                     .all()
-                
                 session_messages[session_id] = [
-                    {"role": msg.role, "content": msg.content}
-                    for msg in session_history
+                    {"role": msg.role, "content": msg.content} for msg in session_history
                 ]
             except Exception as e:
                 logging.error(f"Database error in load_chat_history: {e}")
                 session_messages[session_id] = []
-        
         return session_messages[session_id]
-
+    
     @rt("/")
     async def get(session):
         if 'session_id' not in session:
             session['session_id'] = str(uuid.uuid4())
         session_id = session['session_id']
-
         messages = await load_chat_history(session_id)
-
         return Div(
-            H1(
-                "Chat with Agony Aunt",
-                cls="text-3xl font-bold mb-4 text-white"
-            ),
+            H1("Chat with Agony Aunt", cls="text-3xl font-bold mb-4 text-white"),
             Div(f"Session ID: {session_id}", cls="text-white mb-4"),
             chat(session_id=session_id, messages=messages),
-            Div(
-                Span("Model status: "),
-                Span("⚫", id="model-status-emoji"),
-                cls="model-status text-white mt-4"
-            ),
+            Div(Span("Model status: "), Span("⚫", id="model-status-emoji"), cls="model-status text-white mt-4"),
             Div(id="top-sources"),
             cls="flex flex-col items-center min-h-screen bg-black",
         )
-    #
+    
     def chat_top_sources(top_sources):
-        """Display the filenames of the top sources without URLs."""
-        #
         return Div(
-        Div(
-            Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
             Div(
-                *[
-                    Div(
-                        [
-                            Span(
-                                os.path.basename(source['filename']),
-                                cls="text-green-500"
-                            ),
-                            Span(
-                                f" (Page {source['page']})",
-                                cls="text-zinc-400"
-                            )
-                        ],
+                Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
+                Div(
+                    *[Div(
+                        [Span(os.path.basename(source['filename']), cls="text-green-500"),
+                         Span(f" (Page {source['page']})", cls="text-zinc-400")],
                         cls="font-mono text-sm"
-                    )
-                    for source in top_sources
-                ],
+                    ) for source in top_sources],
+                    cls="flex flex-col items-start gap-2",
+                ),
                 cls="flex flex-col items-start gap-2",
             ),
-            cls="flex flex-col items-start gap-2",
-        ),
-        cls="flex flex-col items-start gap-2 p-2 bg-zinc-800 rounded-md",
-    )
-
-        
-
+            cls="flex flex-col items-start gap-2 p-2 bg-zinc-800 rounded-md",
+        )
+    
     @fasthtml_app.ws("/ws")
     async def ws(msg: str, session_id: str, send):
         logging.info(f"WebSocket received - msg: {msg}, session_id: {session_id}")
-        
         if not session_id:
             logging.error("No session_id received in WebSocket connection!")
             return
         messages = await load_chat_history(session_id)
-
         response_received = asyncio.Event()
-
         max_tokens = 6000
-
+        
         async def update_model_status():
             await asyncio.sleep(3)
             if not response_received.is_set():
                 for _ in range(25):
                     if response_received.is_set():
                         break
-                    await send(
-                        Span(
-                            "🟡",
-                            id="model-status-emoji",
-                            hx_swap_oob="innerHTML"
-                        )
-                    )
+                    await send(Span("🟡", id="model-status-emoji", hx_swap_oob="innerHTML"))
                     await asyncio.sleep(1)
                     if response_received.is_set():
                         break
-                    await send(
-                        Span(
-                            "⚫",
-                            id="model-status-emoji",
-                            hx_swap_oob="innerHTML"
-                        )
-                    )
+                    await send(Span("⚫", id="model-status-emoji", hx_swap_oob="innerHTML"))
                     await asyncio.sleep(1)
                 else:
                     if not response_received.is_set():
-                        await send(
-                            Span(
-                                "🔴",
-                                id="model-status-emoji",
-                                hx_swap_oob="innerHTML"
-                            )
-                        )
+                        await send(Span("🔴", id="model-status-emoji", hx_swap_oob="innerHTML"))
             if response_received.is_set():
-                await send(
-                    Span(
-                        "🟢",
-                        id="model-status-emoji",
-                        hx_swap_oob="innerHTML"
-                    )
-                )
+                await send(Span("🟢", id="model-status-emoji", hx_swap_oob="innerHTML"))
                 await asyncio.sleep(600)
-                await send(
-                    Span(
-                        "⚫",
-                        id="model-status-emoji",
-                        hx_swap_oob="innerHTML"
-                    )
-                )
-
+                await send(Span("⚫", id="model-status-emoji", hx_swap_oob="innerHTML"))
         asyncio.create_task(update_model_status())
-
+        
         messages.append({"role": "user", "content": msg})
         message_index = len(messages) - 1
-
+        
         # Save user message to DB
-        from sqlalchemy.orm import sessionmaker
         new_message = Conversation(
             message_id=str(uuid.uuid4()),
             session_id=session_id,
@@ -498,57 +449,66 @@ def serve_fasthtml():
         )
         sqlalchemy_session.add(new_message)
         sqlalchemy_session.commit()
-
+        
         await send(chat_form(disabled=False))
-        await send(
-            Div(
-                chat_message(message_index, messages=messages),
-                id="messages",
-                hx_swap_oob="beforeend"
-            )
-        )
-
-        # init reranker
-        ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
-
-        # Retrieve top docs from FAISS
+        await send(Div(chat_message(message_index, messages=messages), id="messages", hx_swap_oob="beforeend"))
+        
+        # Combined BM25 and FAISS retrieval:
         query_embedding = emb_model.encode([msg], normalize_embeddings=True).astype('float32')
-        K = 10  # Retrieve more candidates for reranking
+        K = 10
         distances, indices = index.search(query_embedding, K)
-
+        tokenized_query = word_tokenize(msg.lower())
+        bm25_scores = bm25_index.get_scores(tokenized_query)
+        top_bm25_indices = np.argsort(bm25_scores)[-K:][::-1]
+        all_candidate_indices = list(set(indices[0].tolist() + top_bm25_indices.tolist()))
+        
         retrieved_paragraphs = []
         top_sources = []
         docs_for_reranking = []
-
-        for i, idx in enumerate(indices[0][:K]):
+        semantic_scores = {}
+        keyword_scores = {}
+        
+        for idx in all_candidate_indices:
             paragraph_text = df.iloc[idx]['text']
             pdf_filename = df.iloc[idx]['filename']
             page_num = df.iloc[idx]['page']
-            similarity_score = float(1 - distances[0][i])  # Convert FAISS distance to similarity
-            
+            if idx in indices[0]:
+                i = np.where(indices[0] == idx)[0][0]
+                semantic_score = float(1 - distances[0][i])
+                semantic_scores[idx] = semantic_score
+            else:
+                semantic_scores[idx] = 0.0
+            keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
+            keyword_scores[idx] = keyword_score
+            alpha = 0.6  # Weight for semantic search
+            combined_score = alpha * semantic_scores[idx] + (1 - alpha) * keyword_scores[idx]
             retrieved_paragraphs.append(paragraph_text)
-            top_sources.append({'filename': pdf_filename, 'page': page_num, 'similarity_score': similarity_score})
-            
-            # Store document for reranking
+            top_sources.append({
+                'filename': pdf_filename,
+                'page': page_num,
+                'semantic_score': semantic_scores[idx],
+                'keyword_score': keyword_scores[idx],
+                'combined_score': combined_score,
+                'idx': idx
+            })
             docs_for_reranking.append(paragraph_text)
-
-        # **RERANKING PHASE**
+        
+        # Reranking phase using the combined candidates
+        ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
         ranked_results = ranker.rank(query=msg, docs=docs_for_reranking)
-        top_ranked_docs = ranked_results.top_k(3)  # Take the top 3 reranked
-
-        # Extract final top paragraphs and sources after reranking
+        top_ranked_docs = ranked_results.top_k(3)
+        
         final_retrieved_paragraphs = []
         final_top_sources = []
-
         for ranked_doc in top_ranked_docs:
             ranked_idx = docs_for_reranking.index(ranked_doc.text)
             final_retrieved_paragraphs.append(ranked_doc.text)
-            final_top_sources.append(top_sources[ranked_idx])  # Preserve metadata
-
-        # Construct context for LLM
-        context = "\n\n".join(final_retrieved_paragraphs)
-
-    
+            source_info = top_sources[ranked_idx]
+            source_info['reranker_score'] = ranked_doc.score
+            final_top_sources.append(source_info)
+        
+        # Build context and prompt for the LLM
+        context = "\n\n".join(retrieved_paragraphs[:2])
         def build_conversation(messages, max_length=2000):
             conversation = ''
             total_length = 0
@@ -561,9 +521,7 @@ def serve_fasthtml():
                     break
                 conversation = message_text + conversation
             return conversation
-
         conversation_history = build_conversation(messages)
-
         def build_prompt(system_prompt, context, conversation_history):
             return f"""{system_prompt}
 
@@ -573,38 +531,28 @@ Context Information:
 Conversation History:
 {conversation_history}
 Assistant:"""
-        # https://smith.lang.chat/hub
         system_prompt = (
             "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
             "If you don't know the answer, just say that you don't know."
             "Use three sentences maximum and keep the answer concise."
         )
-
-        context = "\n\n".join(retrieved_paragraphs[:2])
         prompt = build_prompt(system_prompt, context, conversation_history)
-
         print(f"Final Prompt being passed to the LLM:\n{prompt}\n")
-
+        
         vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
         payload = {
             "prompt": prompt,
             "max_tokens": 2000,
             "stream": True
         }
-
+        
         async with aiohttp.ClientSession() as client_session:
             async with client_session.post(vllm_url, json=payload) as response:
                 # Create assistant placeholder
                 messages.append({"role": "assistant", "content": ""})
                 message_index = len(messages) - 1
-                await send(
-                    Div(
-                        chat_message(message_index, messages=messages),
-                        id="messages",
-                        hx_swap_oob="beforeend"
-                    )
-                )
-
+                await send(Div(chat_message(message_index, messages=messages), id="messages", hx_swap_oob="beforeend"))
+        
         async with aiohttp.ClientSession() as client_session:
             async with client_session.post(vllm_url, json=payload) as response:
                 if response.status == 200:
@@ -616,22 +564,15 @@ Assistant:"""
                                 if not text.startswith(' ') and messages[message_index]["content"] and not messages[message_index]["content"].endswith(' '):
                                     text = ' ' + text
                                 messages[message_index]["content"] += text
-                                await send(
-                                    Span(
-                                        text,
-                                        hx_swap_oob="beforeend",
-                                        id=f"msg-content-{message_index}"
-                                    )
-                                )
-                    # Save assistant message, referencing top source as the PDF filename
+                                await send(Span(text, hx_swap_oob="beforeend", id=f"msg-content-{message_index}"))
                     new_assistant_message = Conversation(
                         message_id=str(uuid.uuid4()),
                         session_id=session_id,
                         role='assistant',
                         content=messages[message_index]["content"],
-                        top_source_headline=final_top_sources[0]['filename'],  # show the PDF filename
-                        top_source_url=None,  # no URL
-                        cosine_sim_score=final_top_sources[0]['similarity_score']
+                        top_source_headline=final_top_sources[0]['filename'],
+                        top_source_url=None,
+                        cosine_sim_score=final_top_sources[0].get('similarity_score', 0)
                     )
                     sqlalchemy_session.add(new_assistant_message)
                     sqlalchemy_session.commit()
@@ -639,24 +580,11 @@ Assistant:"""
                 else:
                     error_message = "Error: Unable to get response from LLM."
                     messages.append({"role": "assistant", "content": error_message})
-                    await send(
-                        Div(
-                            chat_message(len(messages) - 1, messages=messages),
-                            id="messages",
-                            hx_swap_oob="beforeend"
-                        )
-                    )
-
-        await send(
-            Div(
-                chat_top_sources(final_top_sources),
-                id="top-sources",
-                hx_swap_oob="innerHTML"
-            )
-        )
-
+                    await send(Div(chat_message(len(messages) - 1, messages=messages), id="messages", hx_swap_oob="beforeend"))
+        
+        await send(Div(chat_top_sources(final_top_sources), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
         await send(chat_form(disabled=False))
-
+    
     return fasthtml_app
 
 if __name__ == "__main__":
