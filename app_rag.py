@@ -15,8 +15,8 @@ import os
 import sqlite3
 
 # Constants
-MODELS_DIR = "/llamas_8b"
-MODEL_NAME = "Llama-3.1-8B-Instruct" 
+MODELS_DIR = "/Qwen"
+MODEL_NAME = "Qwen2.5-7B-Instruct-1M" 
 FAISS_DATA_DIR = "/faiss_data_pdfs"  # <--- Updated path
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 USERNAME = "c123ian"
@@ -58,7 +58,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Download the model weights
 try:
-    volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
+    volume = modal.Volume.lookup("Qwen", create_if_missing=False)
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
@@ -125,9 +125,9 @@ def serve_vllm():
     from vllm.entrypoints.logger import RequestLogger
     from vllm.sampling_params import SamplingParams
 
-    # Constants
-    MODEL_NAME = "Llama-3.1-8B-Instruct"
-    MODELS_DIR = "/llamas_8b"
+    # Constants The model's max seq len (1010000) is larger than the maximum number of tokens that can be stored in KV cache (367584)
+    MODEL_NAME = "Qwen2.5-7B-Instruct-1M"
+    MODELS_DIR = "/Qwen"
 
     # FastAPI Web Server
     web_app = fastapi.FastAPI(
@@ -165,7 +165,8 @@ def serve_vllm():
         model=model_path,
         tokenizer=tokenizer_path,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.95,
+        max_model_len=367584
     )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -309,12 +310,14 @@ def serve_fasthtml():
     # Load embedding model
     emb_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
     
+    
     # Prepare BM25 index
     def create_bm25_index(documents):
         tokenized_docs = [word_tokenize(doc.lower()) for doc in documents]
         bm25_index = BM25Okapi(tokenized_docs)
         return bm25_index, tokenized_docs
     bm25_index, tokenized_docs = create_bm25_index(docs)
+
     
     # Initialize FastHTML app
     fasthtml_app, rt = fast_app(
@@ -480,7 +483,7 @@ def serve_fasthtml():
                 semantic_scores[idx] = 0.0
             keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
             keyword_scores[idx] = keyword_score
-            alpha = 0.6  # Weight for semantic search
+            alpha = 0.6  # Weight for semantic search (combsum)
             combined_score = alpha * semantic_scores[idx] + (1 - alpha) * keyword_scores[idx]
             retrieved_paragraphs.append(paragraph_text)
             top_sources.append({
