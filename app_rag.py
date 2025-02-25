@@ -380,41 +380,51 @@ def serve_fasthtml():
                 session_messages[session_id] = []
         return session_messages[session_id]
 
-    @rt("/pdf-image/{image_key}")
+    @fasthtml_app.get("/pdf-image/{image_key}")  # Use FastAPI's native route decorator
     async def get_pdf_image(image_key: str):
         logging.info(f"Image request for key: {image_key}")
-        if image_key in page_images:
-            image_path = page_images[image_key]
-            logging.info(f"Found image path: {image_path}")
-            if os.path.exists(image_path):
-                logging.info(f"Image file exists, serving...")
-                return FileResponse(image_path, media_type="image/png")
+        try:
+            if image_key in page_images:
+                image_path = page_images[image_key]
+                logging.info(f"Found image path: {image_path}")
+                if os.path.exists(image_path):
+                    logging.info(f"Image file exists, serving...")
+                    return FileResponse(image_path, media_type="image/png")
+                else:
+                    logging.error(f"Image file does not exist at path: {image_path}")
+                    parts = image_key.split('_')
+                    if len(parts) >= 2:
+                        pdf_name = '_'.join(parts[:-1])
+                        page_num = int(parts[-1])
+                        pdf_rows = df[df['filename'] == pdf_name]
+                        if not pdf_rows.empty:
+                            pdf_path = pdf_rows.iloc[0]['full_path']
+                            logging.info(f"Found PDF at {pdf_path}, generating image for page {page_num}")
+                            try:
+                                if os.path.exists(pdf_path):
+                                    images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1, dpi=150)
+                                    if images:
+                                        img = images[0]
+                                        buffer = BytesIO()
+                                        img.save(buffer, format='PNG')
+                                        buffer.seek(0)
+                                        return Response(content=buffer.getvalue(), media_type="image/png")
+                            except Exception as e:
+                                logging.error(f"Error generating image on-the-fly: {e}")
+                                return Response(content=f"Error generating image: {str(e)}", 
+                                            media_type="text/plain", 
+                                            status_code=500)
             else:
-                logging.error(f"Image file does not exist at path: {image_path}")
-                parts = image_key.split('_')
-                if len(parts) >= 2:
-                    pdf_name = '_'.join(parts[:-1])
-                    page_num = int(parts[-1])
-                    pdf_rows = df[df['filename'] == pdf_name]
-                    if not pdf_rows.empty:
-                        pdf_path = pdf_rows.iloc[0]['full_path']
-                        logging.info(f"Found PDF at {pdf_path}, generating image for page {page_num}")
-                        try:
-                            if os.path.exists(pdf_path):
-                                images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1, dpi=150)
-                                if images:
-                                    img = images[0]
-                                    buffer = BytesIO()
-                                    img.save(buffer, format='PNG')
-                                    img_data = buffer.getvalue()
-                                    base64_data = base64.b64encode(img_data).decode('utf-8')
-                                    html = f"""
-                                    <img src="data:image/png;base64,{base64_data}" 
-                                        alt="PDF Page {page_num}" style="max-width:100%;" />
-                                    """
-                                    return HTMLResponse(content=html)
-                        except Exception as e:
-                            logging.error(f"Error generating image on-the-fly: {e}")
+                logging.error(f"Image key '{image_key}' not found in page_images dictionary")
+                return Response(content=f"Image key not found: {image_key}", 
+                            media_type="text/plain", 
+                            status_code=404)
+        except Exception as e:
+            logging.error(f"Unexpected error in get_pdf_image: {e}")
+            return Response(content=f"Server error: {str(e)}", 
+                        media_type="text/plain", 
+                        status_code=500)
+        
         return Response(content="Image not found", media_type="text/plain", status_code=404)
 
     def chat_top_sources(top_sources):
