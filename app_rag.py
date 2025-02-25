@@ -428,46 +428,40 @@ def serve_fasthtml():
         return Response(content="Image not found", media_type="text/plain", status_code=404)
 
     def chat_top_sources(top_sources):
+        carousel_items = [
+            Div(
+                Img(
+                    src=f"/pdf-image/{source['image_key']}",
+                    cls="w-full rounded-lg border border-zinc-700"
+                ),
+                id=f"item{i+1}",
+                cls="carousel-item w-full"
+            )
+            for i, source in enumerate(top_sources)
+        ]
+
+        # Navigation buttons for each image
+        carousel_controls = Div(
+            *[
+                A(str(i+1), href=f"#item{i+1}", cls="btn btn-xs")
+                for i in range(len(top_sources))
+            ],
+            cls="flex w-full justify-center gap-2 py-2"
+        )
+
         return Div(
             Div(
                 Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
                 Div(
-                    *[
-                        Div(
-                            Div(
-                                Span(os.path.basename(source['filename']), cls="text-green-500"),
-                                Span(f" (Page {source['page']})", cls="text-zinc-400"),
-                                cls="font-mono text-sm mb-2"
-                            ),
-                            Div(
-                                Button(
-                                    "👁️ View Page",
-                                    cls="px-2 py-1 bg-zinc-700 hover:bg-zinc-600 text-xs rounded",
-                                    onclick=f"document.getElementById('img-container-{i}').classList.toggle('hidden')"
-                                ),
-                                cls="mb-2"
-                            ),
-                            Div(
-                                Iframe(
-                                    src=f"/pdf-image/{source['image_key']}",
-                                    width="100%",
-                                    frameborder="0",
-                                    loading="lazy",
-                                    cls="border border-zinc-700 rounded w-full h-auto min-h-[900px]"  # Large height
-                                ),
-                                id=f"img-container-{i}",
-                                cls="w-full overflow-auto hidden"
-                            ),
-                            cls="flex flex-col w-full bg-zinc-900 p-6 rounded-lg"
-                        )
-                        for i, source in enumerate(top_sources)
-                    ],
-                    cls="grid grid-cols-2 gap-6"  # Full width layout
+                    Div(*carousel_items, cls="carousel w-full"),
+                    carousel_controls,  # Buttons for navigation
+                    cls="flex flex-col w-full"
                 ),
                 cls="flex flex-col w-full gap-6"
             ),
-            cls="w-full max-w-2xl mx-auto bg-zinc-800 rounded-md mt-6 p-6"  # Matches chat width
+            cls="w-full max-w-2xl mx-auto bg-zinc-800 rounded-md mt-6 p-6"
         )
+
 
 
 
