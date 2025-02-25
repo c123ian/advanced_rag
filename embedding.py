@@ -18,7 +18,7 @@ pandas_faiss_image = (
     .pip_install(
         "faiss-cpu","pandas","numpy","huggingface_hub","sentence-transformers",
         "langchain","langchain-community","pypdf","Pillow","rapidocr-onnxruntime",
-        "opencv-python-headless","rank-bm25","nltk","pdf2image"
+        "opencv-python-headless","rank-bm25","nltk","pdf2image","pymupdf"
     )
 )
 
@@ -77,7 +77,7 @@ def upload_pdf(local_pdf_path):
 
 @app.function(image=pandas_faiss_image,volumes={FAISS_DATA_DIR: faiss_volume},timeout=4*60*60)
 def process_pdfs_and_store_embeddings():
-    from langchain_community.document_loaders import PyPDFLoader
+    from langchain_community.document_loaders import PyMuPDFLoader
     from langchain_community.document_loaders.parsers import RapidOCRBlobParser
     import faiss
     import numpy as np
@@ -119,12 +119,8 @@ def process_pdfs_and_store_embeddings():
         os.makedirs(pdf_images_dir, exist_ok=True)
         print(f"Images will be stored in: {pdf_images_dir}")
 
-        loader = PyPDFLoader(
-            pdf_path,
-            mode="page",
-            images_inner_format="markdown-img",
-            images_parser=RapidOCRBlobParser(),
-        )
+        # Use the recommended PyMuPDFLoader
+        loader = PyMuPDFLoader(pdf_path)
         docs = loader.load()
 
         def process_page(page_num):
