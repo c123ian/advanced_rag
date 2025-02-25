@@ -193,44 +193,23 @@ def serve_vllm():
                 max_tokens=max_tokens,
                 stop=["User:", "Assistant:", "\n\n"],
             )
-            # streaming text to appear naturally
+
             async def generate_text():
-                full_response = ""
-                last_yielded_position = 0
-                buffer = ""
-
-                # Remove assistant prefix only once
-                assistant_prefix_removed = False
-
+                previous_text = ""
+                
                 async for result in engine.generate(prompt, sampling_params, request_id):
                     if len(result.outputs) > 0:
                         current_text = result.outputs[0].text
                         
-                        # Handle assistant prefix once
-                        if not assistant_prefix_removed and "Assistant:" in current_text:
+                        # Remove assistant prefix if present (only once)
+                        if "Assistant:" in current_text and previous_text == "":
                             current_text = current_text.split("Assistant:")[-1].lstrip()
-                            assistant_prefix_removed = True
                         
-                        # Only process if we have new content
-                        if len(current_text) > last_yielded_position:
-                            # Get just the new content since last update
-                            new_chunk = current_text[last_yielded_position:]
-                            buffer += new_chunk
-                            
-                            # Split by words but keep track of partial words
-                            words = buffer.split()
-                            
-                            # If we have multiple words, yield all but the last one
-                            if len(words) > 1:
-                                complete_words = ' '.join(words[:-1]) + ' '
-                                yield complete_words
-                                buffer = words[-1]  # Keep the last (potentially incomplete) word
-                            
-                            last_yielded_position = len(current_text)
-                
-                # Yield any remaining content
-                if buffer:
-                    yield buffer
+                        # Get just the new content since last update
+                        if len(current_text) > len(previous_text):
+                            delta = current_text[len(previous_text):]
+                            yield delta
+                            previous_text = current_text
                 
             return StreamingResponse(generate_text(), media_type="text/plain")
         except Exception as e:
@@ -696,36 +675,19 @@ Assistant:"""
             async with client_session.post(vllm_url, json=payload) as response:
                 if response.status == 200:
                     response_received.set()
-                    buffer = ""
                     
-                    async for chunk in response.content:
+                    # Process the response as a stream
+                    async for chunk in response.content.iter_any():
                         if chunk:
                             text = chunk.decode('utf-8')
                             if text:
-                                # Append directly to the message content
                                 messages[message_index]["content"] += text
-                                # Send to UI immediately
-                                await send(Span(text, hx_swap_oob="beforeend", id=f"msg-content-{message_index}"))
-
-                    new_assistant_message = Conversation(
-                        message_id=str(uuid.uuid4()),
-                        session_id=session_id,
-                        role='assistant',
-                        content=messages[message_index]["content"],
-                        top_source_headline=final_top_sources[0]['filename'] if final_top_sources else None,
-                        top_source_url=None,
-                        cosine_sim_score=final_top_sources[0].get('similarity_score', 0) if final_top_sources else None
-                    )
-                    sqlalchemy_session.add(new_assistant_message)
-                    sqlalchemy_session.commit()
-                    logging.info(f"Assistant message committed to DB successfully - Content: {messages[message_index]['content'][:50]}...")
-                else:
-                    error_message = "Error: Unable to get response from LLM."
-                    messages.append({"role": "assistant", "content": error_message})
-                    await send(Div(chat_message(len(messages) - 1, messages=messages), id="messages", hx_swap_oob="beforeend"))
-
-        await send(Div(chat_top_sources(final_top_sources), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
-        await send(chat_form(disabled=False))
+                                # Send each chunk immediately with minimal processing
+                                await send(
+                                    Span(text, hx_swap_oob="beforeend", id=f"msg-content-{message_index}")
+                                )
+                                # Force a small delay to create the "typing" effect
+                                await asyncio.sleep(0.01)
 
     return fasthtml_app
 
