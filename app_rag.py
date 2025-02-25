@@ -193,44 +193,45 @@ def serve_vllm():
                 max_tokens=max_tokens,
                 stop=["User:", "Assistant:", "\n\n"],
             )
-
+            # streaming text to appear naturally
             async def generate_text():
                 full_response = ""
                 last_yielded_position = 0
-                assistant_prefix_removed = False
                 buffer = ""
+
+                # Remove assistant prefix only once
+                assistant_prefix_removed = False
 
                 async for result in engine.generate(prompt, sampling_params, request_id):
                     if len(result.outputs) > 0:
-                        new_text = result.outputs[0].text
-
-                        if not assistant_prefix_removed:
-                            new_text = new_text.split("Assistant:")[-1].lstrip()
+                        current_text = result.outputs[0].text
+                        
+                        # Handle assistant prefix once
+                        if not assistant_prefix_removed and "Assistant:" in current_text:
+                            current_text = current_text.split("Assistant:")[-1].lstrip()
                             assistant_prefix_removed = True
-
-                        if len(new_text) > last_yielded_position:
-                            new_part = new_text[last_yielded_position:]
-                            buffer += new_part
-
+                        
+                        # Only process if we have new content
+                        if len(current_text) > last_yielded_position:
+                            # Get just the new content since last update
+                            new_chunk = current_text[last_yielded_position:]
+                            buffer += new_chunk
+                            
+                            # Split by words but keep track of partial words
                             words = buffer.split()
+                            
+                            # If we have multiple words, yield all but the last one
                             if len(words) > 1:
-                                to_yield = ' '.join(words[:-1]) + ' '
-                                for punct in ['.', '!', '?']:
-                                    to_yield = to_yield.replace(f"{punct}", f"{punct} ")
-                                to_yield = ' '.join(to_yield.split())
-                                buffer = words[-1]
-                                yield to_yield + ' '
-
-                            last_yielded_position = len(new_text)
-
-                        full_response = new_text
-
+                                complete_words = ' '.join(words[:-1]) + ' '
+                                yield complete_words
+                                buffer = words[-1]  # Keep the last (potentially incomplete) word
+                            
+                            last_yielded_position = len(current_text)
+                
+                # Yield any remaining content
                 if buffer:
-                    for punct in ['.', '!', '?']:
-                        buffer = buffer.replace(f"{punct}", f"{punct} ")
-                    buffer = ' '.join(buffer.split())
                     yield buffer
-
+                
             return StreamingResponse(generate_text(), media_type="text/plain")
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
@@ -695,14 +696,17 @@ Assistant:"""
             async with client_session.post(vllm_url, json=payload) as response:
                 if response.status == 200:
                     response_received.set()
-                    async for chunk in response.content.iter_chunked(1024):
+                    buffer = ""
+                    
+                    async for chunk in response.content:
                         if chunk:
-                            text = chunk.decode('utf-8').strip()
+                            text = chunk.decode('utf-8')
                             if text:
-                                if not text.startswith(' ') and messages[message_index]["content"] and not messages[message_index]["content"].endswith(' '):
-                                    text = ' ' + text
+                                # Append directly to the message content
                                 messages[message_index]["content"] += text
+                                # Send to UI immediately
                                 await send(Span(text, hx_swap_oob="beforeend", id=f"msg-content-{message_index}"))
+
                     new_assistant_message = Conversation(
                         message_id=str(uuid.uuid4()),
                         session_id=session_id,
