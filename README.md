@@ -13,7 +13,7 @@ This repository contains an advanced Retrieval-Augmented Generation (RAG) applic
 
 ## Architecture Overview
 
-![Architecture Diagram](![image](https://github.com/user-attachments/assets/233af5c6-5e30-4f29-89e8-a7c891c4da8a)
+![Architecture Diagram](https://github.com/user-attachments/assets/233af5c6-5e30-4f29-89e8-a7c891c4da8a)
 )
 [source](https://parlance-labs.com/education/rag/ben.html)
 
