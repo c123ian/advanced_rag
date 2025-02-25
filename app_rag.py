@@ -195,22 +195,42 @@ def serve_vllm():
             )
 
             async def generate_text():
-                previous_text = ""
-                
+                full_response = ""
+                last_yielded_position = 0
+                assistant_prefix_removed = False
+                buffer = ""
+
                 async for result in engine.generate(prompt, sampling_params, request_id):
                     if len(result.outputs) > 0:
-                        current_text = result.outputs[0].text
-                        
-                        # Remove assistant prefix if present (only once)
-                        if "Assistant:" in current_text and previous_text == "":
-                            current_text = current_text.split("Assistant:")[-1].lstrip()
-                        
-                        # Get just the new content since last update
-                        if len(current_text) > len(previous_text):
-                            delta = current_text[len(previous_text):]
-                            yield delta
-                            previous_text = current_text
-                
+                        new_text = result.outputs[0].text
+
+                        if not assistant_prefix_removed:
+                            new_text = new_text.split("Assistant:")[-1].lstrip()
+                            assistant_prefix_removed = True
+
+                        if len(new_text) > last_yielded_position:
+                            new_part = new_text[last_yielded_position:]
+                            buffer += new_part
+
+                            words = buffer.split()
+                            if len(words) > 1:
+                                to_yield = ' '.join(words[:-1]) + ' '
+                                for punct in ['.', '!', '?']:
+                                    to_yield = to_yield.replace(f"{punct}", f"{punct} ")
+                                to_yield = ' '.join(to_yield.split())
+                                buffer = words[-1]
+                                yield to_yield + ' '
+
+                            last_yielded_position = len(new_text)
+
+                        full_response = new_text
+
+                if buffer:
+                    for punct in ['.', '!', '?']:
+                        buffer = buffer.replace(f"{punct}", f"{punct} ")
+                    buffer = ' '.join(buffer.split())
+                    yield buffer
+
             return StreamingResponse(generate_text(), media_type="text/plain")
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
@@ -675,19 +695,33 @@ Assistant:"""
             async with client_session.post(vllm_url, json=payload) as response:
                 if response.status == 200:
                     response_received.set()
-                    
-                    # Process the response as a stream
-                    async for chunk in response.content.iter_any():
+                    async for chunk in response.content.iter_chunked(1024):
                         if chunk:
-                            text = chunk.decode('utf-8')
+                            text = chunk.decode('utf-8').strip()
                             if text:
+                                if not text.startswith(' ') and messages[message_index]["content"] and not messages[message_index]["content"].endswith(' '):
+                                    text = ' ' + text
                                 messages[message_index]["content"] += text
-                                # Send each chunk immediately with minimal processing
-                                await send(
-                                    Span(text, hx_swap_oob="beforeend", id=f"msg-content-{message_index}")
-                                )
-                                # Force a small delay to create the "typing" effect
-                                await asyncio.sleep(0.01)
+                                await send(Span(text, hx_swap_oob="beforeend", id=f"msg-content-{message_index}"))
+                    new_assistant_message = Conversation(
+                        message_id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        role='assistant',
+                        content=messages[message_index]["content"],
+                        top_source_headline=final_top_sources[0]['filename'] if final_top_sources else None,
+                        top_source_url=None,
+                        cosine_sim_score=final_top_sources[0].get('similarity_score', 0) if final_top_sources else None
+                    )
+                    sqlalchemy_session.add(new_assistant_message)
+                    sqlalchemy_session.commit()
+                    logging.info(f"Assistant message committed to DB successfully - Content: {messages[message_index]['content'][:50]}...")
+                else:
+                    error_message = "Error: Unable to get response from LLM."
+                    messages.append({"role": "assistant", "content": error_message})
+                    await send(Div(chat_message(len(messages) - 1, messages=messages), id="messages", hx_swap_oob="beforeend"))
+
+        await send(Div(chat_top_sources(final_top_sources), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
+        await send(chat_form(disabled=False))
 
     return fasthtml_app
 
