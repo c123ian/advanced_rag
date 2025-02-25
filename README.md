@@ -25,7 +25,7 @@ The application is structured around several key components:
 1. **PDF Processing Pipeline**: Extracts text and images from uploaded PDFs
 2. **Embedding Generation**: Creates vector embeddings for document paragraphs
 3. **Hybrid Search System**: Combines semantic and keyword search with sophisticated reranking
-4. **LLM Integration**: Uses vLLM to serve the Qwen 2.5-7B-Instruct-1M model
+4. **LLM Integration**: Uses vLLM to serve the Qwen 2.5-7B-Instruct-1M model (a vision model, but currently not passing visual rep of the documents, should use [ColPali](https://huggingface.co/blog/manu/colpali)
 5. **Web Interface**: Provides an interactive UI with FastHTML/HTMX
 
 ## Technical Implementation
