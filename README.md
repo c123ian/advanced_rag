@@ -13,7 +13,9 @@ This repository contains an advanced Retrieval-Augmented Generation (RAG) applic
 
 ## Architecture Overview
 
-![Architecture Diagram](https://mermaid.ink/img/pako:eNqNksFqwzAMhl_F-NyTHXvodWUptGzQsVNugWAbp2YxNrYz6Ej77nOcNtBDYQeD9P2S_kmTk9SCkijQMF6-OtJoXAujJiUbFTOF9eAaSF5fkkO5XiXbh_F8VYc8iNsQu7qPz2yP5KNkaqW4sNt6W8Sv1gd1OEAhS2dBcIJvoDxDNV2zS3psFMNfOQ-GWiJDxcvNaVEL5cCPIrb4UBH8oQY-Qx8seFRFz-PgF7TMjj10Tbe1mhtJRTOxc2fDpqBxRGlRBzMaNE4GjyKl6QXNiMw0C-cpCd4lkVBYiAOqnOYjkVGEMHyHb1OFj-7wnEHKkpg8l_vUVRspFRbhXaI_S7lz7Ek0-AvP52QjMgN62pTpgSaNgWMn_9fcugv-a-_zBOSZtGs?type=png)
+![Architecture Diagram](![image](https://github.com/user-attachments/assets/233af5c6-5e30-4f29-89e8-a7c891c4da8a)
+)
+[source](https://parlance-labs.com/education/rag/ben.html)
 
 The application is structured around several key components:
 
