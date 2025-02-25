@@ -451,24 +451,25 @@ def serve_fasthtml():
                                 Iframe(
                                     src=f"/pdf-image/{source['image_key']}",
                                     width="100%",
-                                    height="300",
                                     frameborder="0",
                                     loading="lazy",
-                                    cls="border border-zinc-700 rounded w-full"
+                                    cls="border border-zinc-700 rounded w-full h-auto min-h-[900px]"  # Large height
                                 ),
                                 id=f"img-container-{i}",
-                                cls="w-full overflow-hidden hidden"
+                                cls="w-full overflow-auto hidden"
                             ),
-                            cls="flex flex-col w-full bg-zinc-900 p-3 rounded-lg"
+                            cls="flex flex-col w-full bg-zinc-900 p-6 rounded-lg"
                         )
                         for i, source in enumerate(top_sources)
                     ],
-                    cls="grid grid-cols-1 md:grid-cols-2 gap-4"
+                    cls="grid grid-cols-2 gap-6"  # Full width layout
                 ),
-                cls="flex flex-col w-full gap-3"
+                cls="flex flex-col w-full gap-6"
             ),
-            cls="flex flex-col w-full gap-4 p-4 bg-zinc-800 rounded-md mt-4"
+            cls="w-full max-w-2xl mx-auto bg-zinc-800 rounded-md mt-6 p-6"  # Matches chat width
         )
+
+
 
 
     @rt("/debug")
