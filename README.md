@@ -2,6 +2,10 @@
 
 This repository contains an advanced Retrieval-Augmented Generation (RAG) application built with Modal, vLLM, and FastHTML/HTMX. The application enables semantic search over PDF documents with visual content preservation, hybrid search capabilities (combining semantic and keyword-based search), and sophisticated reranking.
 
+
+![App GUI](https://github.com/user-attachments/assets/912e48bd-3fb5-43ef-9044-81744589f9a9)
+
+
 ## [Live App Here](https://c123ian--rag-serve-fasthtml.modal.run/)
 
 
