@@ -1,4 +1,4 @@
-from components.assets import arrow_circle_icon, github_icon 
+from components.assets import arrow_circle_icon, github_icon
 from components.chat import chat, chat_form, chat_message
 import asyncio
 import modal
@@ -7,28 +7,27 @@ import fastapi
 import logging
 from transformers import AutoTokenizer
 import uuid
-from modal import Secret  # Import Secret
-from fastlite import Database  # For database operations
-from starlette.middleware.sessions import SessionMiddleware  # For session handling
-import aiohttp  # For asynchronous HTTP requests
+from modal import Secret
+from fastlite import Database
+from starlette.middleware.sessions import SessionMiddleware
+import aiohttp
 import os
 import sqlite3
 
 # Constants
 MODELS_DIR = "/Qwen"
-MODEL_NAME = "Qwen2.5-7B-Instruct-1M" 
-FAISS_DATA_DIR = "/faiss_data_pdfs"  # <--- Updated path
+MODEL_NAME = "Qwen2.5-7B-Instruct-1M"
+FAISS_DATA_DIR = "/faiss_data_pdfs"
+UPLOADED_PDFS_DIR = "/faiss_data_pdfs/uploaded_pdfs"
+PDF_IMAGES_DIR = "/faiss_data_pdfs/pdf_images"
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 USERNAME = "c123ian"
 APP_NAME = "rag"
-DATABASE_DIR = "/db_rag_advan"  # Database directory
+DATABASE_DIR = "/db_rag_advan"
 
 db_path = os.path.join(DATABASE_DIR, 'chat_history.db')
-
-# Ensure the directory exists
 os.makedirs(DATABASE_DIR, exist_ok=True)
 
-# Create the table if it does not exist (here we drop if it exists, for demo)
 conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
 cursor.execute('''
@@ -49,60 +48,49 @@ cursor.execute('''
 conn.commit()
 conn.close()
 
-# Step 2: Initialize FastLite Database connection
 db = Database(db_path)
-conversations = db['conversations']  # Access the existing table
+conversations = db['conversations']
 
-# Initialize logging
 logging.basicConfig(level=logging.INFO)
 
-# Download the model weights
 try:
     volume = modal.Volume.lookup("Qwen", create_if_missing=False)
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
-
-# Define the Modal image with required dependencies
+# Update: add pdf2image to the install list
 image = modal.Image.debian_slim(python_version="3.10") \
     .pip_install(
         "vllm==0.7.2",
         "python-fasthtml==0.4.3",
-        "aiohttp",          
-        "faiss-cpu",        
+        "aiohttp",
+        "faiss-cpu",
         "sentence-transformers",
         "pandas",
         "numpy",
         "huggingface_hub",
-        "transformers==4.48.3", # Pinned to avoid LogitsWarper import error
+        "transformers==4.48.3",
         "rerankers",
         "sqlite-minutils",
-        "rank-bm25", 
-        "nltk" ,        
-        "sqlalchemy"
+        "rank-bm25",
+        "nltk",
+        "sqlalchemy",
+        "pdf2image"
     )
 
+# Replace the old faiss_volume definition with the new one
+faiss_volume = modal.Volume.from_name("faiss_data_pdfs", create_if_missing=True)
 
-# Define the FAISS volume (using the new name "faiss_data_pdfs")
-try:
-    faiss_volume = modal.Volume.lookup("faiss_data_pdfs", create_if_missing=False)
-except modal.exception.NotFoundError:
-    raise Exception("Create the FAISS data volume first by running your PDF script")
-
-# Define the database volume
 try:
     db_volume = modal.Volume.lookup("db_data", create_if_missing=True)
 except modal.exception.NotFoundError:
     db_volume = modal.Volume.persisted("db_data")
 
-# Define the Modal app
 app = modal.App(APP_NAME)
 
-# vLLM server implementation with model path handling
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="40GB"), 
-    # gpu=modal.gpu.T4(count=1), # smaller gpu for GUI testing
+    gpu=modal.gpu.A100(count=1, size="40GB"),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
@@ -125,11 +113,9 @@ def serve_vllm():
     from vllm.entrypoints.logger import RequestLogger
     from vllm.sampling_params import SamplingParams
 
-    # Constants The model's max seq len (1010000) is larger than the maximum number of tokens that can be stored in KV cache (367584)
     MODEL_NAME = "Qwen2.5-7B-Instruct-1M"
     MODELS_DIR = "/Qwen"
 
-    # FastAPI Web Server
     web_app = fastapi.FastAPI(
         title=f"OpenAI-compatible {MODEL_NAME} server",
         description="Run an OpenAI-compatible LLM server with vLLM",
@@ -137,7 +123,6 @@ def serve_vllm():
         docs_url="/docs",
     )
 
-    # --- Model Path Detection ---
     def find_model_path(base_dir):
         for root, _, files in os.walk(base_dir):
             if "config.json" in files:
@@ -160,7 +145,6 @@ def serve_vllm():
 
     print(f"Initializing AsyncLLMEngine with model path: {model_path} and tokenizer path: {tokenizer_path}")
 
-    # --- Initialize Engine ---
     engine_args = AsyncEngineArgs(
         model=model_path,
         tokenizer=tokenizer_path,
@@ -171,7 +155,6 @@ def serve_vllm():
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-    # --- Get Model Config ---
     event_loop: Optional[asyncio.AbstractEventLoop] = None
     try:
         event_loop = asyncio.get_running_loop()
@@ -183,23 +166,20 @@ def serve_vllm():
     else:
         model_config = asyncio.run(engine.get_model_config())
 
-    # --- Wrap ModelConfig in OpenAIServingModels ---
     models = OpenAIServingModels(engine_client=engine, model_config=model_config, base_model_paths={MODEL_NAME: model_path})
-
-    # --- Initialize OpenAIServingChat ---
     request_logger = RequestLogger(max_log_len=256)
+    # openai_serving_chat = OpenAIServingChat(engine, model_config, models, "assistant", request_logger, None, "string")
 
     openai_serving_chat = OpenAIServingChat(
-        engine_client=engine,  # ✅ First positional argument
-        model_config=model_config,  # ✅ Second positional argument
-        models=models,  # ✅ Added models argument
-        response_role="assistant",  # ✅ Third positional argument
-        request_logger=request_logger,
-        chat_template=None,
-        chat_template_content_format="string",  # Set to render content as a string
-    )
+    engine_client=engine,  # ✅ First positional argument
+    model_config=model_config,  # ✅ Second positional argument
+    models=models,  # ✅ Added models argument
+    response_role="assistant",  # ✅ Third positional argument
+    request_logger=request_logger,  # ✅ Fourth positional argument
+    chat_template=None,  
+    chat_template_content_format="string",  
+)
 
-    # --- Completion Endpoint ---
     @web_app.post("/v1/completions")
     async def completion_generator(request: fastapi.Request) -> StreamingResponse:
         try:
@@ -252,30 +232,28 @@ def serve_vllm():
                     yield buffer
 
             return StreamingResponse(generate_text(), media_type="text/plain")
-
         except Exception as e:
-            return JSONResponse(
-                status_code=500,
-                content={"error": str(e)}
-            )
+            return JSONResponse(status_code=500, content={"error": str(e)})
 
     return web_app
 
-# FastHTML web interface implementation with RAG
 @app.function(
     image=image,
-    volumes={FAISS_DATA_DIR: faiss_volume, DATABASE_DIR: db_volume},
+    volumes={
+        FAISS_DATA_DIR: faiss_volume,
+        DATABASE_DIR: db_volume
+    },
     secrets=[modal.Secret.from_name("my-custom-secret-3")]
 )
-
 @modal.asgi_app()
 def serve_fasthtml():
     import faiss
     import os
+    import pickle
     from sentence_transformers import SentenceTransformer
     import pandas as pd
-    from starlette.middleware.sessions import SessionMiddleware
-    from fastapi.middleware import Middleware
+    import logging
+    from starlette.middleware import Middleware
     from starlette.websockets import WebSocket
     import uuid
     import asyncio
@@ -288,38 +266,66 @@ def serve_fasthtml():
     import nltk
     import numpy as np
     from rank_bm25 import BM25Okapi
+    from fastapi.responses import FileResponse, Response, HTMLResponse
+    from io import BytesIO
+    import base64
+    from PIL import Image
+    from pdf2image import convert_from_path
 
     NLTK_DATA_DIR = "/tmp/nltk_data"
     os.makedirs(NLTK_DATA_DIR, exist_ok=True)
     nltk.data.path.append(NLTK_DATA_DIR)
     nltk.download("punkt", download_dir=NLTK_DATA_DIR)
     nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
-    
-    
-    # Updated file paths
+
+    print(f"Contents of FAISS_DATA_DIR ({FAISS_DATA_DIR}):")
+    if os.path.exists(FAISS_DATA_DIR):
+        print(f"  Directory exists, contains: {os.listdir(FAISS_DATA_DIR)}")
+    else:
+        print(f"  Directory does not exist!")
+
+    print(f"Contents of PDF_IMAGES_DIR ({PDF_IMAGES_DIR}):")
+    if os.path.exists(PDF_IMAGES_DIR):
+        print(f"  Directory exists, contains: {os.listdir(PDF_IMAGES_DIR)}")
+    else:
+        print(f"  Directory does not exist!")
+
     FAISS_INDEX_PATH = os.path.join(FAISS_DATA_DIR, "faiss_index.bin")
     DATA_PICKLE_PATH = os.path.join(FAISS_DATA_DIR, "data.pkl")
-    
-    # Load FAISS index
+    PDF_PAGE_IMAGES_PATH = os.path.join(FAISS_DATA_DIR, "pdf_page_image_paths.pkl")
+
+    print(f"Loading FAISS index from {FAISS_INDEX_PATH}")
+    print(f"  File exists: {os.path.exists(FAISS_INDEX_PATH)}")
     index = faiss.read_index(FAISS_INDEX_PATH)
-    
-    # Load PDF-based DataFrame (assumes columns "filename", "text", "page")
+
+    print(f"Loading DataFrame from {DATA_PICKLE_PATH}")
+    print(f"  File exists: {os.path.exists(DATA_PICKLE_PATH)}")
     df = pd.read_pickle(DATA_PICKLE_PATH)
     docs = df['text'].tolist()
-    
-    # Load embedding model
+
+    print(f"Loading image paths from {PDF_PAGE_IMAGES_PATH}")
+    print(f"  File exists: {os.path.exists(PDF_PAGE_IMAGES_PATH)}")
+    page_images = {}
+    try:
+        with open(PDF_PAGE_IMAGES_PATH, "rb") as f:
+            page_images = pickle.load(f)
+        print(f"  Loaded {len(page_images)} image paths")
+        for key, path in list(page_images.items())[:2]:
+            print(f"  Image key: {key}, path: {path}")
+            print(f"  Path exists: {os.path.exists(path)}")
+    except Exception as e:
+        print(f"  Error loading image paths: {e}")
+        logging.error(f"Error loading PDF page images: {e}")
+
     emb_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    
-    
-    # Prepare BM25 index
+
     def create_bm25_index(documents):
         tokenized_docs = [word_tokenize(doc.lower()) for doc in documents]
         bm25_index = BM25Okapi(tokenized_docs)
         return bm25_index, tokenized_docs
+
     bm25_index, tokenized_docs = create_bm25_index(docs)
 
-    
-    # Initialize FastHTML app
     fasthtml_app, rt = fast_app(
         hdrs=(
             Script(src="https://cdn.tailwindcss.com"),
@@ -337,12 +343,10 @@ def serve_fasthtml():
             )
         ]
     )
-    
-    # Session-specific messages
+
     session_messages = {}
-    
-    # SQLAlchemy base + model
     Base = declarative_base()
+
     class Conversation(Base):
         __tablename__ = 'conversations_history_table_sqlalchemy_v2'
         message_id = Column(String, primary_key=True)
@@ -353,12 +357,11 @@ def serve_fasthtml():
         top_source_url = Column(String)
         cosine_sim_score = Column(Float)
         created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    
-    # Create a SQLAlchemy engine + session
+
     db_engine = create_engine(f'sqlite:///{os.path.join(DATABASE_DIR, "chat_history.db")}')
     Session = sessionmaker(bind=db_engine)
     sqlalchemy_session = Session()
-    
+
     async def load_chat_history(session_id):
         if not isinstance(session_id, str):
             logging.warning(f"Invalid session_id type: {type(session_id)}. Converting to string.")
@@ -376,7 +379,142 @@ def serve_fasthtml():
                 logging.error(f"Database error in load_chat_history: {e}")
                 session_messages[session_id] = []
         return session_messages[session_id]
-    
+
+    @rt("/pdf-image/{image_key}")
+    async def get_pdf_image(image_key: str):
+        logging.info(f"Image request for key: {image_key}")
+        if image_key in page_images:
+            image_path = page_images[image_key]
+            logging.info(f"Found image path: {image_path}")
+            if os.path.exists(image_path):
+                logging.info(f"Image file exists, serving...")
+                return FileResponse(image_path, media_type="image/png")
+            else:
+                logging.error(f"Image file does not exist at path: {image_path}")
+                parts = image_key.split('_')
+                if len(parts) >= 2:
+                    pdf_name = '_'.join(parts[:-1])
+                    page_num = int(parts[-1])
+                    pdf_rows = df[df['filename'] == pdf_name]
+                    if not pdf_rows.empty:
+                        pdf_path = pdf_rows.iloc[0]['full_path']
+                        logging.info(f"Found PDF at {pdf_path}, generating image for page {page_num}")
+                        try:
+                            if os.path.exists(pdf_path):
+                                images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1, dpi=150)
+                                if images:
+                                    img = images[0]
+                                    buffer = BytesIO()
+                                    img.save(buffer, format='PNG')
+                                    img_data = buffer.getvalue()
+                                    base64_data = base64.b64encode(img_data).decode('utf-8')
+                                    html = f"""
+                                    <img src="data:image/png;base64,{base64_data}" 
+                                        alt="PDF Page {page_num}" style="max-width:100%;" />
+                                    """
+                                    return HTMLResponse(content=html)
+                        except Exception as e:
+                            logging.error(f"Error generating image on-the-fly: {e}")
+        return Response(content="Image not found", media_type="text/plain", status_code=404)
+
+    def chat_top_sources(top_sources):
+        return Div(
+            Div(
+                Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
+                Div(
+                    *[
+                        Div(
+                            Div(
+                                Span(os.path.basename(source['filename']), cls="text-green-500"),
+                                Span(f" (Page {source['page']})", cls="text-zinc-400"),
+                                cls="font-mono text-sm mb-2"
+                            ),
+                            Div(
+                                Button(
+                                    "👁️ View Page",
+                                    cls="px-2 py-1 bg-zinc-700 hover:bg-zinc-600 text-xs rounded",
+                                    onclick=f"document.getElementById('img-container-{i}').classList.toggle('hidden')"
+                                ),
+                                cls="mb-2"
+                            ),
+                            Div(
+                                Iframe(
+                                    src=f"/pdf-image/{source['image_key']}",
+                                    width="100%",
+                                    height="300",
+                                    frameborder="0",
+                                    loading="lazy",
+                                    cls="border border-zinc-700 rounded w-full"
+                                ),
+                                id=f"img-container-{i}",
+                                cls="w-full overflow-hidden hidden"
+                            ),
+                            cls="flex flex-col w-full bg-zinc-900 p-3 rounded-lg"
+                        )
+                        for i, source in enumerate(top_sources)
+                    ],
+                    cls="grid grid-cols-1 md:grid-cols-2 gap-4"
+                ),
+                cls="flex flex-col w-full gap-3"
+            ),
+            cls="flex flex-col w-full gap-4 p-4 bg-zinc-800 rounded-md mt-4"
+        )
+
+
+    @rt("/debug")
+    async def debug_info():
+        html = ["<h1>Debug Information</h1>"]
+        directories = [
+            FAISS_DATA_DIR,
+            PDF_IMAGES_DIR,
+            UPLOADED_PDFS_DIR
+        ]
+        html.append("<h2>Directories:</h2><ul>")
+        for directory in directories:
+            if os.path.exists(directory):
+                items = os.listdir(directory)
+                html.append(f"<li>✅ {directory}: {len(items)} items</li>")
+                html.append("<ul>")
+                for item in items[:10]:
+                    full_path = os.path.join(directory, item)
+                    is_dir = os.path.isdir(full_path)
+                    html.append(f"<li>{'📁' if is_dir else '📄'} {item}</li>")
+                if len(items) > 10:
+                    html.append(f"<li>... and {len(items) - 10} more</li>")
+                html.append("</ul>")
+            else:
+                html.append(f"<li>❌ {directory}: Not found</li>")
+        html.append("</ul>")
+
+        html.append("<h2>Image Paths:</h2>")
+        if page_images:
+            html.append(f"<p>Found {len(page_images)} image paths</p>")
+            html.append("<ul>")
+            for key, path in list(page_images.items())[:5]:
+                exists = os.path.exists(path)
+                html.append(f"<li>{key} → {path} {'✅' if exists else '❌'}</li>")
+            html.append("</ul>")
+
+            if page_images:
+                test_key = next(iter(page_images.keys()))
+                test_path = page_images[test_key]
+                html.append(f"<h3>Testing image: {test_key}</h3>")
+                if os.path.exists(test_path):
+                    try:
+                        with open(test_path, "rb") as img_file:
+                            img_data = img_file.read()
+                            base64_data = base64.b64encode(img_data).decode('utf-8')
+                            html.append("<p>✅ Image loaded successfully</p>")
+                            html.append(f'<img src="data:image/png;base64,{base64_data}" style="max-width:300px; border:1px solid #ccc;">')
+                    except Exception as e:
+                        html.append(f"<p>❌ Error reading image: {e}</p>")
+                else:
+                    html.append(f"<p>❌ Image not found at path: {test_path}</p>")
+        else:
+            html.append("<p>No image paths loaded</p>")
+
+        return HTMLResponse(content="<br>".join(html))
+
     @rt("/")
     async def get(session):
         if 'session_id' not in session:
@@ -384,31 +522,15 @@ def serve_fasthtml():
         session_id = session['session_id']
         messages = await load_chat_history(session_id)
         return Div(
-            H1("Chat with Agony Aunt", cls="text-3xl font-bold mb-4 text-white"),
+            H1("Chat with PDF Documents", cls="text-3xl font-bold mb-4 text-white"),
             Div(f"Session ID: {session_id}", cls="text-white mb-4"),
+            A("Debug Info", href="/debug", cls="text-blue-500 underline mb-4", target="_blank"),
             chat(session_id=session_id, messages=messages),
             Div(Span("Model status: "), Span("⚫", id="model-status-emoji"), cls="model-status text-white mt-4"),
             Div(id="top-sources"),
             cls="flex flex-col items-center min-h-screen bg-black",
         )
-    
-    def chat_top_sources(top_sources):
-        return Div(
-            Div(
-                Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
-                Div(
-                    *[Div(
-                        [Span(os.path.basename(source['filename']), cls="text-green-500"),
-                         Span(f" (Page {source['page']})", cls="text-zinc-400")],
-                        cls="font-mono text-sm"
-                    ) for source in top_sources],
-                    cls="flex flex-col items-start gap-2",
-                ),
-                cls="flex flex-col items-start gap-2",
-            ),
-            cls="flex flex-col items-start gap-2 p-2 bg-zinc-800 rounded-md",
-        )
-    
+
     @fasthtml_app.ws("/ws")
     async def ws(msg: str, session_id: str, send):
         logging.info(f"WebSocket received - msg: {msg}, session_id: {session_id}")
@@ -418,7 +540,7 @@ def serve_fasthtml():
         messages = await load_chat_history(session_id)
         response_received = asyncio.Event()
         max_tokens = 6000
-        
+
         async def update_model_status():
             await asyncio.sleep(3)
             if not response_received.is_set():
@@ -438,12 +560,12 @@ def serve_fasthtml():
                 await send(Span("🟢", id="model-status-emoji", hx_swap_oob="innerHTML"))
                 await asyncio.sleep(600)
                 await send(Span("⚫", id="model-status-emoji", hx_swap_oob="innerHTML"))
+
         asyncio.create_task(update_model_status())
-        
+
         messages.append({"role": "user", "content": msg})
         message_index = len(messages) - 1
-        
-        # Save user message to DB
+
         new_message = Conversation(
             message_id=str(uuid.uuid4()),
             session_id=session_id,
@@ -452,66 +574,71 @@ def serve_fasthtml():
         )
         sqlalchemy_session.add(new_message)
         sqlalchemy_session.commit()
-        
+
         await send(chat_form(disabled=False))
         await send(Div(chat_message(message_index, messages=messages), id="messages", hx_swap_oob="beforeend"))
-        
-        # Combined BM25 and FAISS retrieval:
+
         query_embedding = emb_model.encode([msg], normalize_embeddings=True).astype('float32')
         K = 10
         distances, indices = index.search(query_embedding, K)
         tokenized_query = word_tokenize(msg.lower())
         bm25_scores = bm25_index.get_scores(tokenized_query)
         top_bm25_indices = np.argsort(bm25_scores)[-K:][::-1]
+
         all_candidate_indices = list(set(indices[0].tolist() + top_bm25_indices.tolist()))
-        
+
         retrieved_paragraphs = []
-        top_sources = []
+        top_sources_data = []
         docs_for_reranking = []
         semantic_scores = {}
         keyword_scores = {}
-        
+
         for idx in all_candidate_indices:
             paragraph_text = df.iloc[idx]['text']
             pdf_filename = df.iloc[idx]['filename']
             page_num = df.iloc[idx]['page']
+            image_key = df.iloc[idx]['image_key']
+
             if idx in indices[0]:
                 i = np.where(indices[0] == idx)[0][0]
                 semantic_score = float(1 - distances[0][i])
                 semantic_scores[idx] = semantic_score
             else:
                 semantic_scores[idx] = 0.0
+
             keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
             keyword_scores[idx] = keyword_score
-            alpha = 0.6  # Weight for semantic search (combsum)
+
+            alpha = 0.6
             combined_score = alpha * semantic_scores[idx] + (1 - alpha) * keyword_scores[idx]
+
             retrieved_paragraphs.append(paragraph_text)
-            top_sources.append({
+            top_sources_data.append({
                 'filename': pdf_filename,
                 'page': page_num,
                 'semantic_score': semantic_scores[idx],
                 'keyword_score': keyword_scores[idx],
                 'combined_score': combined_score,
+                'image_key': image_key,
                 'idx': idx
             })
             docs_for_reranking.append(paragraph_text)
-        
-        # Reranking phase using the combined candidates
+
         ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
         ranked_results = ranker.rank(query=msg, docs=docs_for_reranking)
         top_ranked_docs = ranked_results.top_k(3)
-        
+
         final_retrieved_paragraphs = []
         final_top_sources = []
         for ranked_doc in top_ranked_docs:
             ranked_idx = docs_for_reranking.index(ranked_doc.text)
             final_retrieved_paragraphs.append(ranked_doc.text)
-            source_info = top_sources[ranked_idx]
+            source_info = top_sources_data[ranked_idx]
             source_info['reranker_score'] = ranked_doc.score
             final_top_sources.append(source_info)
-        
-        # Build context and prompt for the LLM
+
         context = "\n\n".join(retrieved_paragraphs[:2])
+
         def build_conversation(messages, max_length=2000):
             conversation = ''
             total_length = 0
@@ -524,7 +651,9 @@ def serve_fasthtml():
                     break
                 conversation = message_text + conversation
             return conversation
+
         conversation_history = build_conversation(messages)
+
         def build_prompt(system_prompt, context, conversation_history):
             return f"""{system_prompt}
 
@@ -534,28 +663,29 @@ Context Information:
 Conversation History:
 {conversation_history}
 Assistant:"""
+
         system_prompt = (
             "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
             "If you don't know the answer, just say that you don't know."
             "Use three sentences maximum and keep the answer concise."
         )
+
         prompt = build_prompt(system_prompt, context, conversation_history)
         print(f"Final Prompt being passed to the LLM:\n{prompt}\n")
-        
+
         vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
         payload = {
             "prompt": prompt,
             "max_tokens": 2000,
             "stream": True
         }
-        
+
         async with aiohttp.ClientSession() as client_session:
             async with client_session.post(vllm_url, json=payload) as response:
-                # Create assistant placeholder
                 messages.append({"role": "assistant", "content": ""})
                 message_index = len(messages) - 1
                 await send(Div(chat_message(message_index, messages=messages), id="messages", hx_swap_oob="beforeend"))
-        
+
         async with aiohttp.ClientSession() as client_session:
             async with client_session.post(vllm_url, json=payload) as response:
                 if response.status == 200:
@@ -573,9 +703,9 @@ Assistant:"""
                         session_id=session_id,
                         role='assistant',
                         content=messages[message_index]["content"],
-                        top_source_headline=final_top_sources[0]['filename'],
+                        top_source_headline=final_top_sources[0]['filename'] if final_top_sources else None,
                         top_source_url=None,
-                        cosine_sim_score=final_top_sources[0].get('similarity_score', 0)
+                        cosine_sim_score=final_top_sources[0].get('similarity_score', 0) if final_top_sources else None
                     )
                     sqlalchemy_session.add(new_assistant_message)
                     sqlalchemy_session.commit()
@@ -584,10 +714,10 @@ Assistant:"""
                     error_message = "Error: Unable to get response from LLM."
                     messages.append({"role": "assistant", "content": error_message})
                     await send(Div(chat_message(len(messages) - 1, messages=messages), id="messages", hx_swap_oob="beforeend"))
-        
+
         await send(Div(chat_top_sources(final_top_sources), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
         await send(chat_form(disabled=False))
-    
+
     return fasthtml_app
 
 if __name__ == "__main__":
